@@ -197,6 +197,43 @@ Additional parameters can be required by the challenge or another applicable
 profile. This document does not mandate `keyid`, `alg`, or a particular `tag`
 value; their use follows {{HTTP-SIG}} and the applicable deployment or profile.
 
+## The `proxy-authority` Signature Parameter {#proxy-authority}
+
+The `proxy-authority` signature metadata parameter identifies the intended
+proxy. It MUST be included in signatures authenticating standard CONNECT,
+whether unsolicited or challenged, and MUST NOT be used for extended CONNECT
+or HTTP/1.1 Upgrade. In Signature-Input, its value is a String containing the
+proxy hostname or IP address followed by a colon and an explicit port. It is
+protected by the signature through `@signature-params` as defined in
+{{Section 2.3 of HTTP-SIG}}.
+
+The client MUST derive the value from its proxy configuration, retaining the
+configured hostname rather than substituting a DNS-resolved address. The value
+MUST be normalized as follows:
+
+* Hostnames are lowercase ASCII, with internationalized labels represented as
+  A-labels {{!IDNA=RFC5890}} and any final dot omitted.
+* IPv4 addresses use four decimal octets without leading zeros. IPv6 addresses
+  use the hexadecimal representation specified in Section 4 of
+  {{!IPV6-TEXT=RFC5952}}, enclosed in square brackets. IPv6 zone identifiers
+  are not permitted.
+* The port is a decimal integer from 1 through 65535 without leading zeros.
+  It MUST be included even when it is the default port for the configured proxy
+  scheme. For example, `https://proxy.example` produces `proxy.example:443`.
+
+The value MUST NOT contain a scheme, user information, path, query, or fragment.
+For example, `proxy.example:8080` and `[2001:db8::1]:443` are valid values.
+The proxy MUST reject authentication unless the value is in this normalized
+form and exactly matches one of its configured proxy identities. An identity
+MUST NOT be accepted solely because it appears in the request.
+
+An Accept-Signature challenge for standard CONNECT MUST include
+`proxy-authority` in its Boolean true form (`;proxy-authority`, equivalent to
+`;proxy-authority=?1`). This requests inclusion of the parameter without
+specifying a proxy identity. The client MUST supply the normalized String
+value derived from its proxy configuration in Signature-Input. The proxy
+checks that value against its configured identities as described above.
+
 
 # Authentication Procedure {#authentication-procedure}
 
@@ -225,7 +262,8 @@ MUST contain one dictionary member specifying the signature required by this
 mechanism, using the syntax in {{Section 5.1 of HTTP-SIG}}. It MUST specify the
 coverage required by {{signature-requirements}}, a fresh `nonce` value, and the
 `created` and `expires` parameters in their Boolean true form. The response
-MUST include `Cache-Control: no-store`.
+MUST include `Cache-Control: no-store`. For standard CONNECT, the challenge
+MUST also include `proxy-authority` as specified in {{proxy-authority}}.
 
 The nonce MUST be unpredictable and unique among challenges that the server
 can still accept. The server MUST assign each challenge a bounded lifetime and
@@ -271,7 +309,8 @@ Before accepting a signed request, the server MUST:
    signature, verify that server policy permits its use.
 1. Check the signature coverage and parameters against {{signature-requirements}}
    and any issued challenge, and verify the signature according to
-   {{Section 3.2 of HTTP-SIG}}.
+   {{Section 3.2 of HTTP-SIG}}. For standard CONNECT, this includes checking
+   `proxy-authority` against the proxy's configured identities.
 1. Check that the signature lifetime does not exceed the server's maximum and
    that the current time falls within the signature validity period. The server
    MAY allow a small, bounded tolerance for clock skew.
@@ -370,10 +409,13 @@ Editorial note: this example anticipates changes to WIMSE omitting
 draft-ietf-wimse-http-signature-07.
 
 The proxy permits unsolicited signatures. The client sends its WIT and
-signature with a fresh client-generated nonce. The `wimse-aud` value is
-the proxy identity configured for this WIMSE deployment. The signing key
-and algorithm come from the WIT, so `keyid` and `alg` are absent from
-Signature-Input. Response signing is not requested.
+signature with a fresh client-generated nonce. The `proxy-authority`
+value is `proxy.example:443`, derived from the configured proxy URI.
+The `wimse-aud` value is the proxy identity configured for this WIMSE
+deployment. Both identify the intended proxy and are checked
+independently. The signing key and algorithm come from the WIT, so
+`keyid` and `alg` are absent from Signature-Input. Response signing is
+not requested.
 
 ~~~
 NOTE: '\' line wrapping per RFC 8792
@@ -391,15 +433,17 @@ Workload-Identity-Token: eyJhbGciOiJFZDI1NTE5IiwidHlwIjoid2l0K2p3dCIsIm\
 Signature-Input: sig1=("@method" "@authority" \
   "workload-identity-token");created=1791244800;expires=1791244860;\
   nonce="sGcptixoRlVhKrE6YIc1oqzQP3vBoc64";\
-  tag="wimse-workload-to-workload";wimse-aud="https://proxy.example"
-Signature: sig1=:SCnWV6Cf2nA72ZxD21Mmhts1cFO3T3aLBCFTaPghZBhOEmqV+x5zIA\
-  gOUUOd0szJNZ1hmsprco67FGouQ0E8Bg==:
+  tag="wimse-workload-to-workload";proxy-authority="proxy.example:443";\
+  wimse-aud="https://proxy.example"
+Signature: sig1=:5qi1gPTvGrDF4B5R1OK5L+4VmD85WCIPlM+bHm7UUmAEehf4Wv/TRp\
+  0a5KNeDKuQUQfwQ4n40519anF+8skaDQ==:
 ~~~
 {: #example-connect-signed title="Signed CONNECT request"}
 
-The proxy validates the WIT, audience, and request signature, atomically
-records the client nonce under the verified signing key, and authorizes
-the tunnel. It responds without an Accept-Signature exchange:
+The proxy validates the WIT, audience, proxy authority, and request
+signature, atomically records the client nonce under the verified
+signing key, and authorizes the tunnel. It responds without an
+Accept-Signature exchange:
 
 ~~~
 HTTP/1.1 200 Connection Established
@@ -564,12 +608,13 @@ NOT allow previously accepted requests to be accepted again; affected requests
 MUST be rejected until that protection can be guaranteed.
 
 For standard CONNECT, `@authority` identifies the tunnel destination, not the
-proxy. An unsolicited signature could therefore be accepted at another proxy
-that trusts the same key and maintains independent replay state. Deployments
-accepting unsolicited signatures at such proxies need recipient binding from
-an applicable profile, such as WIMSE's `wimse-aud`, or keys whose acceptance is
-restricted to the intended recipient. This document defines no additional
-audience parameter.
+proxy. The `proxy-authority` parameter binds the signature to the intended
+proxy, provided both parties check it against their configuration. Proxies
+sharing an accepted identity and signing-key trust MUST coordinate replay
+protection if they can accept the same signature. The parameter does not bind
+a transport scheme or authenticate the proxy to the client, and does not
+prevent live relay to the intended proxy. Additional audience requirements,
+such as WIMSE's `wimse-aud`, continue to apply independently.
 
 This mechanism does not authenticate the server or protect tunnel traffic.
 Without a protected transport, credentials and request details are visible,
@@ -604,6 +649,15 @@ Signature Derived Component Names" registry established by
 * Status: Active
 * Target: Request
 * Reference: {{protocol-component}} of this document
+
+This document also requests registration of the following entry in the "HTTP
+Signature Metadata Parameters" registry established by {{Section 6.3 of HTTP-SIG}},
+using the template in {{Section 6.3.1 of HTTP-SIG}}:
+
+* Name: `proxy-authority`
+* Description: The hostname or IP address and explicit port of the intended
+  proxy for a standard CONNECT request
+* Reference: {{proxy-authority}} of this document
 
 
 --- back
